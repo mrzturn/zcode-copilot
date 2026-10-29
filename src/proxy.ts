@@ -14,11 +14,37 @@
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { Readable } from "node:stream";
+import { mkdir, appendFile, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
+import { Readable, Transform } from "node:stream";
 import { COPILOT_STATIC_HEADERS, copilotBaseUrl } from "./copilot/constants.ts";
 import { credentialStatus, ensureFreshCredential, NotLoggedInError } from "./token-manager.ts";
+import { daemonLogPath, pluginDataDir } from "./store.ts";
 
 const MAX_BODY_BYTES = 256 * 1024 * 1024;
+
+/** 每个上游请求记录一行摘要；失败响应追加错误体片段，便于定位 ZCode 侧真实失败。 */
+async function proxyLog(line: string): Promise<void> {
+  try {
+    const target = daemonLogPath();
+    await mkdir(dirname(target), { recursive: true });
+    await appendFile(target, `[${new Date().toISOString()}] ${line}\n`, "utf-8");
+  } catch {
+    // 日志失败不影响转发。
+  }
+}
+
+/** ZCODE_COPILOT_DEBUG=1 时把完整请求体落到 ~/.zcode-copilot/dumps/ 供离线排查。 */
+async function dumpRequest(kind: string, model: string, body: Buffer): Promise<void> {
+  if (process.env.ZCODE_COPILOT_DEBUG !== "1") return;
+  try {
+    const dir = `${pluginDataDir()}/dumps`;
+    await mkdir(dir, { recursive: true });
+    await writeFile(`${dir}/${Date.now()}-${kind}-${model}.json`, body, "utf-8");
+  } catch {
+    // 转储失败不影响转发。
+  }
+}
 
 interface UpstreamRoute {
   upstreamPath: string;
@@ -96,6 +122,23 @@ function analyzeBody(parsed: unknown): BodyAnalysis {
 }
 
 /**
+ * messages（Claude）兼容性清洗：
+ * GitHub Copilot 的 Claude 5.x 已不支持 `thinking: {type: "enabled", budget_tokens}`，
+ * 会返回 invalid_request_error 并要求改用 `thinking: {type: "adaptive"}` +
+ * `output_config.effort`。这里把 ZCode 等客户端发来的 enabled 形态降级为
+ * adaptive（budget_tokens 无对应映射，直接丢弃），新旧 Claude 模型均接受。
+ */
+function sanitizeMessagesBody(parsed: unknown): unknown {
+  if (!parsed || typeof parsed !== "object") return parsed;
+  const body = { ...(parsed as Record<string, unknown>) };
+  const thinking = body.thinking as { type?: unknown } | undefined;
+  if (thinking && typeof thinking === "object" && thinking.type === "enabled") {
+    body.thinking = { type: "adaptive" };
+  }
+  return body;
+}
+
+/**
  * chat/completions 兼容性清洗（对齐 pi 的 compat 标志）：
  * - 移除 store（不支持）
  * - 移除 reasoning_effort（completions 模型不支持，responses 模型不会走此路由）
@@ -115,6 +158,73 @@ function sanitizeChatCompletionsBody(parsed: unknown): unknown {
     });
   }
   return body;
+}
+
+/**
+ * Copilot responses SSE 的缺陷：同一 output item 的各事件（output_text.delta、
+ * content_part.added、reasoning_summary_part.added、output_item.done 等）携带的
+ * item_id / item.id 彼此不同、也与 `response.output_item.added` 注册的不一致
+ * （实测 gpt-6-luna 同一 message 的 5 个事件用了 5 个不同 id）。
+ * @ai-sdk/openai 按 item_id 关联流事件，查表 miss 时报 "text part …" /
+ * 读 undefined.summaryParts，ZCode 表现为 turn failed。
+ * 所有事件都带稳定的 output_index，这里以它为锚，把每个事件的 id
+ * 归一为该 output_index 在 output_item.added 时注册的 item id。
+ */
+function createResponsesItemRewriter(): Transform {
+  const indexToId = new Map<number, string>();
+  let buffer = "";
+  const rewriteLine = (line: string): string => {
+    if (!line.startsWith("data: ")) return line;
+    let json: Record<string, unknown>;
+    try {
+      json = JSON.parse(line.slice(6)) as Record<string, unknown>;
+    } catch {
+      return line;
+    }
+    const type = json.type;
+    if (typeof type !== "string") return line;
+    const outputIndex = json.output_index;
+    if (type === "response.output_item.added") {
+      const item = json.item as { id?: unknown } | undefined;
+      if (typeof outputIndex === "number" && item && typeof item.id === "string") {
+        indexToId.set(outputIndex, item.id);
+      }
+      return line;
+    }
+    if (typeof outputIndex !== "number") return line;
+    const canonical = indexToId.get(outputIndex);
+    if (canonical === undefined) return line;
+    let changed = false;
+    if (typeof json.item_id === "string" && json.item_id !== canonical) {
+      json.item_id = canonical;
+      changed = true;
+    }
+    if (type === "response.output_item.done") {
+      const item = json.item as { id?: unknown } | undefined;
+      if (item && typeof item.id === "string" && item.id !== canonical) {
+        item.id = canonical;
+        changed = true;
+      }
+    }
+    return changed ? `data: ${JSON.stringify(json)}` : line;
+  };
+  return new Transform({
+    transform(chunk: Buffer, _encoding: string, callback: (error?: Error | null, data?: string) => void) {
+      try {
+        buffer += chunk.toString("utf-8");
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        callback(null, lines.map(rewriteLine).join("\n") + (lines.length ? "\n" : ""));
+      } catch {
+        // 改写失败时宁可透传原始数据。
+        callback(null, chunk.toString("utf-8"));
+      }
+    },
+    flush(callback: (error?: Error | null, data?: string) => void) {
+      if (buffer) callback(null, rewriteLine(buffer));
+      else callback();
+    },
+  });
 }
 
 export function createProxyServer(): Server {
@@ -154,16 +264,26 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   const bodyBuffer = routeInfo.kind === "models" ? null : await readBody(req);
   let bodyToSend: Buffer | null = bodyBuffer;
   let analysis: BodyAnalysis = { hasImage: false };
+  let requestModel = "unknown";
   if (bodyBuffer !== null && bodyBuffer.length > 0) {
     try {
       const parsed = JSON.parse(bodyBuffer.toString("utf-8"));
       analysis = analyzeBody(parsed);
-      const sanitized = routeInfo.kind === "chat" ? sanitizeChatCompletionsBody(parsed) : parsed;
+      if (typeof (parsed as { model?: unknown }).model === "string") {
+        requestModel = (parsed as { model: string }).model;
+      }
+      const sanitized =
+        routeInfo.kind === "chat"
+          ? sanitizeChatCompletionsBody(parsed)
+          : routeInfo.kind === "messages"
+            ? sanitizeMessagesBody(parsed)
+            : parsed;
       bodyToSend = Buffer.from(JSON.stringify(sanitized), "utf-8");
     } catch {
       // 非 JSON 请求体原样转发。
     }
   }
+  void dumpRequest(routeInfo.kind, requestModel, bodyBuffer ?? Buffer.alloc(0));
 
   const headers: Record<string, string> = {
     Authorization: `Bearer ${credential.access}`,
@@ -195,6 +315,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   req.on("close", () => upstreamAbort.abort());
 
   let upstream: Response;
+  const startedAt = Date.now();
   try {
     upstream = await fetch(upstreamUrl, {
       method: routeInfo.kind === "models" ? "GET" : "POST",
@@ -204,15 +325,22 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     });
   } catch (error) {
     if (upstreamAbort.signal.aborted) return; // 客户端已断开
+    void proxyLog(`upstream fetch failed ${routeInfo.kind} model=${requestModel}: ${error instanceof Error ? error.message : String(error)}`);
     throw error;
   }
 
-  if (!upstream.ok && !upstream.body) {
+  if (!upstream.ok) {
     const text = await upstream.text();
+    void proxyLog(
+      `upstream ${upstream.status} ${routeInfo.kind} model=${requestModel} ${Date.now() - startedAt}ms: ${text.slice(0, 800)}`,
+    );
     sendJson(res, upstream.status, {
       error: { message: `Copilot API ${upstream.status}: ${text.slice(0, 2000)}`, type: "upstream_error" },
     });
     return;
+  }
+  if (routeInfo.kind !== "models") {
+    void proxyLog(`upstream ${upstream.status} ${routeInfo.kind} model=${requestModel} ${Date.now() - startedAt}ms`);
   }
 
   const responseHeaders: Record<string, string> = {};
@@ -224,8 +352,16 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
   const nodeStream = Readable.fromWeb(upstream.body as import("node:stream/web").ReadableStream);
-  nodeStream.pipe(res);
+  if (routeInfo.kind === "responses") {
+    nodeStream.pipe(createResponsesItemRewriter()).pipe(res);
+  } else {
+    nodeStream.pipe(res);
+  }
   nodeStream.on("error", (error: unknown) => {
+    void proxyLog(
+      `stream aborted ${routeInfo.kind} model=${requestModel} ${Date.now() - startedAt}ms: ${error instanceof Error ? error.message : String(error)}`,
+    );
     // 上游中断时尽量把已收到的部分写完。
     res.destroy(error instanceof Error ? error : new Error(String(error)));
-  });}
+  });
+}

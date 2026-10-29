@@ -1,6 +1,6 @@
 // src/daemon.ts
-import { appendFile, mkdir as mkdir2, writeFile as writeFile2 } from "node:fs/promises";
-import { dirname as dirname2 } from "node:path";
+import { appendFile as appendFile2, mkdir as mkdir3, writeFile as writeFile3 } from "node:fs/promises";
+import { dirname as dirname3 } from "node:path";
 
 // src/copilot/constants.ts
 var COPILOT_USER_AGENT = "GitHubCopilotChat/0.35.0";
@@ -47,7 +47,9 @@ async function fetchJson(url, init) {
 
 // src/proxy.ts
 import { createServer } from "node:http";
-import { Readable } from "node:stream";
+import { mkdir as mkdir2, appendFile, writeFile as writeFile2 } from "node:fs/promises";
+import { dirname as dirname2 } from "node:path";
+import { Readable, Transform } from "node:stream";
 
 // src/store.ts
 import { chmod, copyFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
@@ -178,6 +180,24 @@ async function credentialStatus() {
 
 // src/proxy.ts
 var MAX_BODY_BYTES = 256 * 1024 * 1024;
+async function proxyLog(line) {
+  try {
+    const target = daemonLogPath();
+    await mkdir2(dirname2(target), { recursive: true });
+    await appendFile(target, `[${(/* @__PURE__ */ new Date()).toISOString()}] ${line}
+`, "utf-8");
+  } catch {
+  }
+}
+async function dumpRequest(kind, model, body) {
+  if (process.env.ZCODE_COPILOT_DEBUG !== "1") return;
+  try {
+    const dir = `${pluginDataDir()}/dumps`;
+    await mkdir2(dir, { recursive: true });
+    await writeFile2(`${dir}/${Date.now()}-${kind}-${model}.json`, body, "utf-8");
+  } catch {
+  }
+}
 function route(method, rawPath) {
   const path = rawPath.replace(/\/+$/, "") || "/";
   if (method === "GET" && (path === "/v1/models" || path === "/models")) {
@@ -237,6 +257,15 @@ function analyzeBody(parsed) {
   }
   return result;
 }
+function sanitizeMessagesBody(parsed) {
+  if (!parsed || typeof parsed !== "object") return parsed;
+  const body = { ...parsed };
+  const thinking = body.thinking;
+  if (thinking && typeof thinking === "object" && thinking.type === "enabled") {
+    body.thinking = { type: "adaptive" };
+  }
+  return body;
+}
 function sanitizeChatCompletionsBody(parsed) {
   if (!parsed || typeof parsed !== "object") return parsed;
   const body = { ...parsed };
@@ -251,6 +280,61 @@ function sanitizeChatCompletionsBody(parsed) {
     });
   }
   return body;
+}
+function createResponsesItemRewriter() {
+  const indexToId = /* @__PURE__ */ new Map();
+  let buffer = "";
+  const rewriteLine = (line) => {
+    if (!line.startsWith("data: ")) return line;
+    let json;
+    try {
+      json = JSON.parse(line.slice(6));
+    } catch {
+      return line;
+    }
+    const type = json.type;
+    if (typeof type !== "string") return line;
+    const outputIndex = json.output_index;
+    if (type === "response.output_item.added") {
+      const item = json.item;
+      if (typeof outputIndex === "number" && item && typeof item.id === "string") {
+        indexToId.set(outputIndex, item.id);
+      }
+      return line;
+    }
+    if (typeof outputIndex !== "number") return line;
+    const canonical = indexToId.get(outputIndex);
+    if (canonical === void 0) return line;
+    let changed = false;
+    if (typeof json.item_id === "string" && json.item_id !== canonical) {
+      json.item_id = canonical;
+      changed = true;
+    }
+    if (type === "response.output_item.done") {
+      const item = json.item;
+      if (item && typeof item.id === "string" && item.id !== canonical) {
+        item.id = canonical;
+        changed = true;
+      }
+    }
+    return changed ? `data: ${JSON.stringify(json)}` : line;
+  };
+  return new Transform({
+    transform(chunk, _encoding, callback) {
+      try {
+        buffer += chunk.toString("utf-8");
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        callback(null, lines.map(rewriteLine).join("\n") + (lines.length ? "\n" : ""));
+      } catch {
+        callback(null, chunk.toString("utf-8"));
+      }
+    },
+    flush(callback) {
+      if (buffer) callback(null, rewriteLine(buffer));
+      else callback();
+    }
+  });
 }
 function createProxyServer() {
   return createServer((req, res) => {
@@ -285,15 +369,20 @@ async function handle(req, res) {
   const bodyBuffer = routeInfo.kind === "models" ? null : await readBody(req);
   let bodyToSend = bodyBuffer;
   let analysis = { hasImage: false };
+  let requestModel = "unknown";
   if (bodyBuffer !== null && bodyBuffer.length > 0) {
     try {
       const parsed = JSON.parse(bodyBuffer.toString("utf-8"));
       analysis = analyzeBody(parsed);
-      const sanitized = routeInfo.kind === "chat" ? sanitizeChatCompletionsBody(parsed) : parsed;
+      if (typeof parsed.model === "string") {
+        requestModel = parsed.model;
+      }
+      const sanitized = routeInfo.kind === "chat" ? sanitizeChatCompletionsBody(parsed) : routeInfo.kind === "messages" ? sanitizeMessagesBody(parsed) : parsed;
       bodyToSend = Buffer.from(JSON.stringify(sanitized), "utf-8");
     } catch {
     }
   }
+  void dumpRequest(routeInfo.kind, requestModel, bodyBuffer ?? Buffer.alloc(0));
   const headers = {
     Authorization: `Bearer ${credential.access}`,
     ...COPILOT_STATIC_HEADERS,
@@ -322,6 +411,7 @@ async function handle(req, res) {
   const upstreamAbort = new AbortController();
   req.on("close", () => upstreamAbort.abort());
   let upstream;
+  const startedAt = Date.now();
   try {
     upstream = await fetch(upstreamUrl, {
       method: routeInfo.kind === "models" ? "GET" : "POST",
@@ -331,14 +421,21 @@ async function handle(req, res) {
     });
   } catch (error) {
     if (upstreamAbort.signal.aborted) return;
+    void proxyLog(`upstream fetch failed ${routeInfo.kind} model=${requestModel}: ${error instanceof Error ? error.message : String(error)}`);
     throw error;
   }
-  if (!upstream.ok && !upstream.body) {
+  if (!upstream.ok) {
     const text = await upstream.text();
+    void proxyLog(
+      `upstream ${upstream.status} ${routeInfo.kind} model=${requestModel} ${Date.now() - startedAt}ms: ${text.slice(0, 800)}`
+    );
     sendJson(res, upstream.status, {
       error: { message: `Copilot API ${upstream.status}: ${text.slice(0, 2e3)}`, type: "upstream_error" }
     });
     return;
+  }
+  if (routeInfo.kind !== "models") {
+    void proxyLog(`upstream ${upstream.status} ${routeInfo.kind} model=${requestModel} ${Date.now() - startedAt}ms`);
   }
   const responseHeaders = {};
   const contentType = upstream.headers.get("content-type");
@@ -349,8 +446,15 @@ async function handle(req, res) {
     return;
   }
   const nodeStream = Readable.fromWeb(upstream.body);
-  nodeStream.pipe(res);
+  if (routeInfo.kind === "responses") {
+    nodeStream.pipe(createResponsesItemRewriter()).pipe(res);
+  } else {
+    nodeStream.pipe(res);
+  }
   nodeStream.on("error", (error) => {
+    void proxyLog(
+      `stream aborted ${routeInfo.kind} model=${requestModel} ${Date.now() - startedAt}ms: ${error instanceof Error ? error.message : String(error)}`
+    );
     res.destroy(error instanceof Error ? error : new Error(String(error)));
   });
 }
@@ -358,8 +462,8 @@ async function handle(req, res) {
 // src/daemon.ts
 async function log(line) {
   try {
-    await mkdir2(dirname2(daemonLogPath()), { recursive: true });
-    await appendFile(daemonLogPath(), `[${(/* @__PURE__ */ new Date()).toISOString()}] ${line}
+    await mkdir3(dirname3(daemonLogPath()), { recursive: true });
+    await appendFile2(daemonLogPath(), `[${(/* @__PURE__ */ new Date()).toISOString()}] ${line}
 `, "utf-8");
   } catch {
   }
@@ -378,8 +482,8 @@ async function main() {
     server.once("error", reject);
     server.listen(port, "127.0.0.1", () => resolve());
   });
-  await mkdir2(pluginDataDir(), { recursive: true });
-  await writeFile2(
+  await mkdir3(pluginDataDir(), { recursive: true });
+  await writeFile3(
     daemonMetaPath(),
     JSON.stringify({ pid: process.pid, port, startedAt: Date.now() }, null, 2) + "\n",
     "utf-8"
