@@ -141,14 +141,14 @@ function sanitizeMessagesBody(parsed: unknown): unknown {
 /**
  * chat/completions 兼容性清洗（对齐 pi 的 compat 标志）：
  * - 移除 store（不支持）
- * - 移除 reasoning_effort（completions 模型不支持，responses 模型不会走此路由）
  * - developer 角色 → system（不支持 developer）
+ * reasoning_effort 保留透传：gemini / kimi 等模型在 /models 中声明了
+ * reasoning_effort 档位，ZCode 只会为这些模型生成该参数。
  */
 function sanitizeChatCompletionsBody(parsed: unknown): unknown {
   if (!parsed || typeof parsed !== "object") return parsed;
   const body = { ...(parsed as Record<string, unknown>) };
   delete body.store;
-  delete body.reasoning_effort;
   if (Array.isArray(body.messages)) {
     body.messages = body.messages.map((message) => {
       if (message && typeof message === "object" && (message as { role?: unknown }).role === "developer") {

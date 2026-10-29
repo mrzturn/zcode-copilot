@@ -5,10 +5,10 @@
 import { importFromPiIfAvailable, readCredential, writeCredential } from "./store.ts";
 import { credentialStatus, ensureFreshCredential } from "./token-manager.ts";
 import { checkDaemon, ensureDaemon } from "./daemon-manage.ts";
-import { enableCopilotModels, fetchCopilotModels } from "./copilot/models.ts";
+import { enableCopilotModels, fetchCopilotModels, type CopilotModelInfo } from "./copilot/models.ts";
 import { copilotBaseUrl } from "./copilot/constants.ts";
-import { buildProviderPlans, modelFamily, type ModelReasoningInput } from "./catalog.ts";
-import { detectReasoningForModels } from "./reasoning-probe.ts";
+import { buildProviderPlans, modelFamily, type ClaudeThinkingOffType } from "./catalog.ts";
+import { detectClaudeOffType } from "./reasoning-probe.ts";
 import { inspectCopilotProviders, upsertCopilotProviders } from "./zcode-config.ts";
 
 export interface SetupSummary {
@@ -60,11 +60,13 @@ export async function runSetup(): Promise<SetupSummary> {
   }
 
   let enabledIds: string[] = [];
+  let catalogModels: CopilotModelInfo[] = [];
   try {
     const catalog = await fetchCopilotModels(copilotToken, enterpriseDomain);
     const enableTargets = catalog.policyModelIds.filter(isEnableCandidate);
     enabledIds = enableTargets.length > 0 ? await enableCopilotModels(copilotToken, enableTargets, enterpriseDomain) : [];
     availableModelIds = [...new Set([...catalog.availableModelIds, ...enabledIds])];
+    catalogModels = catalog.models;
     const current = await readCredential();
     if (current) {
       await writeCredential({ ...current, availableModelIds });
@@ -83,6 +85,17 @@ export async function runSetup(): Promise<SetupSummary> {
     }
   }
 
+  const availableSet = new Set(availableModelIds);
+  const availableModels = catalogModels.filter((model) => availableSet.has(model.id));
+  if (availableModels.length !== availableModelIds.length) {
+    // 模型列表拉取失败退回缓存时缺少元数据，构造降级信息（catalog 走静态回退）。
+    for (const modelId of availableModelIds) {
+      if (!availableModels.some((model) => model.id === modelId)) {
+        availableModels.push({ id: modelId, pickerEnabled: true, supportsToolCalls: true, degraded: true });
+      }
+    }
+  }
+
   if (availableModelIds.length === 0) {
     return {
       ok: false,
@@ -93,19 +106,20 @@ export async function runSetup(): Promise<SetupSummary> {
     };
   }
 
-  // 实测每个模型的思考档位与 Claude 关闭机制（各模型支持集合不同；失败时 catalog 内部回退静态值）。
-  let specByModel: Map<string, ModelReasoningInput> | undefined;
+  // 思考档位与上下文等元数据直接使用 /models 声明（catalog 内部回退静态值）；
+  // 仅 Claude 的"关闭思考"请求形态需要逐模型实测（各代际不同）。
+  const offTypes = new Map<string, ClaudeThinkingOffType>();
   try {
-    specByModel = await detectReasoningForModels(
-      copilotToken,
-      copilotBaseUrl(copilotToken, enterpriseDomain),
-      availableModelIds,
-    );
+    const baseUrl = copilotBaseUrl(copilotToken, enterpriseDomain);
+    for (const model of availableModels) {
+      if (modelFamily(model.id) !== "claude") continue;
+      offTypes.set(model.id, await detectClaudeOffType(copilotToken, baseUrl, model.id));
+    }
   } catch {
-    specByModel = undefined;
+    // 探测失败时统一回退 "disabled"。
   }
 
-  const plans = buildProviderPlans(availableModelIds, specByModel);
+  const plans = buildProviderPlans(availableModels, offTypes);
   const { backupPath } = await upsertCopilotProviders(plans);
   const daemon = await ensureDaemon();
   const status = await credentialStatus();

@@ -12,6 +12,18 @@ export interface CopilotModelInfo {
   policyState?: string;
   /** 工具调用能力（false 的模型对 coding agent 无用，直接过滤）。 */
   supportsToolCalls: boolean;
+  /** /models 声明的思考档位（权威来源）；未声明表示不支持思考。 */
+  reasoningEfforts?: string[];
+  /** /models 声明的上下文窗口（token）。 */
+  contextWindow?: number;
+  /** /models 声明的最大输出 token。 */
+  maxOutputTokens?: number;
+  /** /models 声明的视觉输入能力。 */
+  vision?: boolean;
+  /** 视觉输入是否包含 PDF。 */
+  pdf?: boolean;
+  /** true 表示来自缓存的模型 ID（拉取 /models 失败的降级路径），无任何能力元数据。 */
+  degraded?: boolean;
   name?: string;
   vendor?: string;
 }
@@ -28,6 +40,10 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
 }
 
+function readPositiveInt(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
 export function parseCopilotModelCatalog(raw: unknown, allowPolicyFallback: boolean): CopilotModelCatalog {
   const data = asRecord(raw)?.data;
   if (!Array.isArray(data)) throw new Error("Invalid Copilot models response");
@@ -40,11 +56,27 @@ export function parseCopilotModelCatalog(raw: unknown, allowPolicyFallback: bool
     const capabilities = asRecord(item.capabilities);
     const supports = asRecord(capabilities?.supports);
     if (supports?.tool_calls === false) continue;
+    const limits = asRecord(capabilities?.limits);
+    const reasoningEfforts = Array.isArray(supports?.reasoning_effort)
+      ? (supports.reasoning_effort as unknown[]).filter((v): v is string => typeof v === "string" && v.length > 0)
+      : undefined;
+    const visionMedia = asRecord(limits?.vision);
+    const supportedMediaTypes = Array.isArray(visionMedia?.supported_media_types)
+      ? (visionMedia.supported_media_types as unknown[]).filter((v): v is string => typeof v === "string")
+      : [];
+    const vision = supports?.vision === true;
+    const contextWindow = readPositiveInt(limits?.max_context_window_tokens);
+    const maxOutputTokens = readPositiveInt(limits?.max_output_tokens);
     models.push({
       id,
       pickerEnabled: item.model_picker_enabled === true,
       policyState: asRecord(item.policy)?.state as string | undefined,
       supportsToolCalls: supports?.tool_calls !== false,
+      reasoningEfforts: reasoningEfforts && reasoningEfforts.length > 0 ? reasoningEfforts : undefined,
+      contextWindow,
+      maxOutputTokens,
+      vision,
+      pdf: vision && supportedMediaTypes.includes("application/pdf"),
       name: typeof item.name === "string" ? item.name : undefined,
       vendor: typeof item.vendor === "string" ? item.vendor : undefined,
     });

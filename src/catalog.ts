@@ -4,14 +4,15 @@
  * 分类与兼容性结论来自 pi 的 copilot 目录（packages/ai/catalog/providers/github-copilot.ts）：
  * - Claude 4.x/5.x 走 anthropic /v1/messages；
  * - gpt-* / grok-* / oswe* / mai-* 走 openai /responses；
- * - 其余模型走 openai /chat/completions（且不支持 store / developer 角色 / reasoning_effort）。
+ * - 其余模型（gemini / kimi 等）走 openai /chat/completions。
  *
- * 思考档位（reasoning effort）各模型支持集合不同，由 reasoning-probe.ts 在 setup 时
- * 实测确定；此处只保留探测失败时的静态回退值（实测于 2026-10 业务版订阅）。
+ * 思考档位与上下文/输出上限优先使用 /models 声明的能力（capabilities.supports.
+ * reasoning_effort / capabilities.limits），声明缺失时回退本文件的静态值。
  */
 
 import { proxyBaseUrl } from "./copilot/constants.ts";
-import type { ProviderPlan } from "./zcode-config.ts";
+import type { CopilotModelInfo } from "./copilot/models.ts";
+import type { CopilotProviderId, ProviderPlan } from "./zcode-config.ts";
 
 export type ModelFamily = "claude" | "responses" | "completions";
 
@@ -21,23 +22,21 @@ export function modelFamily(modelId: string): ModelFamily {
   return "completions";
 }
 
-/** 探测失败时的回退档位（不含 disabled/off 值）。 */
-export type ReasoningFallbackKey = "claude" | "gpt" | "grok" | "completions";
-
-export const STATIC_REASONING_FALLBACK: Record<ReasoningFallbackKey, string[]> = {
-  claude: ["low", "medium", "high"],
-  gpt: ["low", "medium", "high"],
-  grok: ["minimal", "low", "medium", "high", "xhigh"],
-  completions: [],
-};
-
 /** Claude 关闭思考的机制（实测各模型不同）：
  * - between_tools：5.5 家族要求（thinking disabled 已被拒绝）；
  * - disabled：4.x / 部分 5.x 接受标准 anthropic 形态；
  * - omit：只能省略 thinking 字段（CEL 空对象合并）。 */
 export type ClaudeThinkingOffType = "between_tools" | "disabled" | "omit";
 
-/** GitHub "扩展能力" 表格中支持 1M token 上下文的模型（来自 pi 目录维护的清单）。 */
+/** /models 声明缺失时的回退值（实测于 2026-10 业务版订阅）。 */
+export const STATIC_REASONING_FALLBACK: Record<"claude" | "gpt" | "grok" | "completions", string[]> = {
+  claude: ["low", "medium", "high"],
+  gpt: ["low", "medium", "high"],
+  grok: ["low", "medium", "high", "xhigh"],
+  completions: [],
+};
+
+/** GitHub "扩展能力" 表格中支持 1M token 上下文的模型（声明缺失时的回退）。 */
 const EXTENDED_CONTEXT_MODEL_IDS = new Set([
   "claude-fable-5",
   "claude-opus-4.8",
@@ -55,25 +54,25 @@ function contextWindowFor(modelId: string, family: ModelFamily): number {
   if (EXTENDED_CONTEXT_MODEL_IDS.has(modelId)) return 1_000_000;
   if (family === "claude") return 200_000;
   if (/^gpt-[56]/.test(modelId)) return 400_000;
-  if (/^grok-/.test(modelId)) return 131_072;
+  if (/^grok-/.test(modelId)) return 500_000;
   return 128_000;
 }
 
 function maxOutputTokensFor(modelId: string, family: ModelFamily): number {
   if (family === "claude") return 64_000;
-  if (/^gpt-[56]/.test(modelId)) return 128_000;
-  if (/^grok-/.test(modelId)) return 64_000;
+  if (/^gpt-[56]/.test(modelId) || /^grok-/.test(modelId)) return 128_000;
   return 32_768;
 }
 
 /**
  * ZCode 档位值 → 请求参数的 CEL 映射。
- * - Claude：Copilot 的 /v1/messages 已不接受 thinking {type:enabled,budget_tokens}，
- *   按 400 报错提示改用 thinking adaptive + output_config.effort（low~max 实测可用）；
+ * - Claude：thinking adaptive + output_config.effort（400 报错指定的形态），
  *   关闭档按模型探测结果选 between_tools / disabled / 省略字段。
- * - responses：reasoning.effort 直接透传（none/minimal/…/max，以探测结果为准）。
+ * - responses：reasoning.effort 直接透传。
+ * - completions（gemini / kimi 等）：reasoning_effort 直接透传。
  */
-function reasoningMap(family: ModelFamily, offType: ClaudeThinkingOffType): string {
+function reasoningMap(family: ModelFamily, offType: ClaudeThinkingOffType, hasEfforts: boolean): string {
+  if (!hasEfforts) return "{}";
   if (family === "claude") {
     const offValue =
       offType === "between_tools"
@@ -87,7 +86,8 @@ function reasoningMap(family: ModelFamily, offType: ClaudeThinkingOffType): stri
       ': {"thinking": {"type": "adaptive"}, "output_config": {"effort": reasoningLevel}}',
     ].join(" ");
   }
-  return '{"reasoning": {"effort": reasoningLevel}}';
+  if (family === "responses") return '{"reasoning": {"effort": reasoningLevel}}';
+  return '{"reasoning_effort": reasoningLevel}';
 }
 
 function maxOutputTokensMap(family: ModelFamily): string {
@@ -96,120 +96,97 @@ function maxOutputTokensMap(family: ModelFamily): string {
   return "{'max_completion_tokens': maxOutputTokens}";
 }
 
-function supportsImage(modelId: string, family: ModelFamily): boolean {
-  if (family === "claude") return true;
-  if (/^gpt-[56]/.test(modelId) || /^grok-/.test(modelId)) return true;
-  void modelId;
-  return false;
-}
-
-/** mid-conversation system 消息：pi 验证过 Copilot 对 claude / openai responses 家族可透传。 */
-function supportsMidConversationSystem(modelId: string, family: ModelFamily): boolean {
-  if (family === "claude" || family === "responses") return true;
-  return modelId === "kimi-k3";
-}
-
 /**
- * 生成模型的 ZCode 配置。spec.efforts 为探测到的档位（不含关闭档）：
- * - claude：首位统一加 "disabled"（按 offType 映射为真正的关闭形态）；
- * - responses：直接使用探测值（支持 none 的模型以 none 作为关闭档）。
+ * 生成模型的 ZCode 配置。
+ * - claude：首位统一加 "disabled"，其余使用声明/回退档位；
+ * - responses / completions：直接使用声明档位（支持 none 的模型以 none 作为关闭档）。
  */
-export interface ModelReasoningInput {
-  readonly efforts: readonly string[];
-  readonly offType: ClaudeThinkingOffType;
-}
-
-export function buildModelConfig(modelId: string, spec: ModelReasoningInput): Record<string, unknown> {
-  const family = modelFamily(modelId);
-  const values =
-    family === "claude"
-      ? ["disabled", ...spec.efforts]
+export function buildModelConfig(
+  model: CopilotModelInfo,
+  offType: ClaudeThinkingOffType,
+): Record<string, unknown> {
+  const family = modelFamily(model.id);
+  // /models 的 reasoning_effort 声明是权威来源：声明缺失即不支持思考；
+  // 仅降级路径（拿不到元数据的缓存 ID）才使用家族静态回退。
+  const efforts = model.degraded
+    ? family === "claude"
+      ? STATIC_REASONING_FALLBACK.claude
       : family === "responses"
-        ? [...spec.efforts]
-        : ["disabled"];
+        ? /^grok-/.test(model.id)
+          ? STATIC_REASONING_FALLBACK.grok
+          : STATIC_REASONING_FALLBACK.gpt
+        : STATIC_REASONING_FALLBACK.completions
+    : (model.reasoningEfforts ?? []);
+  const values = family === "claude" ? ["disabled", ...efforts] : [...efforts];
+  const vision = model.vision ?? (family === "claude" || /^gpt-[56]/.test(model.id) || /^grok-/.test(model.id));
+  const contextWindow = model.contextWindow ?? contextWindowFor(model.id, family);
+  const maxOutputTokens = model.maxOutputTokens ?? maxOutputTokensFor(model.id, family);
   return {
     enabled: true,
     properties: {
-      contextWindow: contextWindowFor(modelId, family),
+      contextWindow,
       inputFormat: {
         supportsText: true,
-        supportsImage: supportsImage(modelId, family),
+        supportsImage: vision,
         supportsVideo: false,
         supportsAudio: false,
-        supportsPdf: false,
+        supportsPdf: model.pdf === true,
       },
       outputFormat: { supportsText: true },
       supportsToolCall: true,
       supportsJsonSchemaOutput: false,
       supportsNativeWebSearch: false,
-      supportsMidConversationSystem: supportsMidConversationSystem(modelId, family),
+      // pi 验证过 Copilot 对 claude / openai 家族可透传 mid-conversation system。
+      supportsMidConversationSystem: family !== "completions" || model.id === "kimi-k3",
     },
     optionSpecs: {
       reasoningLevel: {
         values,
-        map: family === "completions" ? "{}" : reasoningMap(family, spec.offType),
+        map: reasoningMap(family, offType, values.length > 0 && !(values.length === 1 && values[0] === "disabled")),
       },
-      maxOutputTokens: { max: maxOutputTokensFor(modelId, family), map: maxOutputTokensMap(family) },
+      maxOutputTokens: { max: maxOutputTokens, map: maxOutputTokensMap(family) },
     },
   };
 }
 
-/** 按订阅可用模型生成要写入 ZCode 的提供商计划；specByModel 缺项用家族回退。 */
+/** 按订阅可用模型生成要写入 ZCode 的提供商计划。offTypes 为 Claude 关闭机制探测结果。 */
 export function buildProviderPlans(
-  availableModelIds: readonly string[],
-  specByModel?: ReadonlyMap<string, ModelReasoningInput>,
+  availableModels: readonly CopilotModelInfo[],
+  offTypes: ReadonlyMap<string, ClaudeThinkingOffType> = new Map(),
 ): ProviderPlan[] {
-  const byFamily = new Map<ModelFamily, string[]>();
-  for (const modelId of availableModelIds) {
-    const family = modelFamily(modelId);
+  const byFamily = new Map<ModelFamily, CopilotModelInfo[]>();
+  for (const model of availableModels) {
+    const family = modelFamily(model.id);
     const list = byFamily.get(family) ?? [];
-    list.push(modelId);
+    list.push(model);
     byFamily.set(family, list);
   }
-  const specFor = (modelId: string): ModelReasoningInput => {
-    const family = modelFamily(modelId);
-    const probed = specByModel?.get(modelId);
-    if (probed) return probed;
-    if (family === "responses") {
-      return {
-        efforts: /^grok-/.test(modelId) ? STATIC_REASONING_FALLBACK.grok : STATIC_REASONING_FALLBACK.gpt,
-        offType: "omit",
-      };
-    }
-    if (family === "claude") return { efforts: STATIC_REASONING_FALLBACK.claude, offType: "disabled" };
-    return { efforts: [], offType: "omit" };
-  };
+  const toPlan = (
+    family: ModelFamily,
+    providerId: CopilotProviderId,
+    providerName: string,
+    apiType: ProviderPlan["apiType"],
+    baseUrl: string,
+  ): ProviderPlan => ({
+    providerId,
+    providerName,
+    apiType,
+    baseUrl,
+    models: (byFamily.get(family) ?? []).map((model) => ({
+      modelId: model.id,
+      config: buildModelConfig(model, offTypes.get(model.id) ?? "disabled"),
+    })),
+  });
   const base = proxyBaseUrl();
   const plans: ProviderPlan[] = [];
-  const claudeIds = byFamily.get("claude") ?? [];
-  if (claudeIds.length > 0) {
-    plans.push({
-      providerId: "copilot-claude",
-      providerName: "GitHub Copilot (Claude)",
-      apiType: "anthropic-messages",
-      baseUrl: base,
-      models: claudeIds.map((modelId) => ({ modelId, config: buildModelConfig(modelId, specFor(modelId)) })),
-    });
+  if ((byFamily.get("claude") ?? []).length > 0) {
+    plans.push(toPlan("claude", "copilot-claude", "GitHub Copilot (Claude)", "anthropic-messages", base));
   }
-  const responsesIds = byFamily.get("responses") ?? [];
-  if (responsesIds.length > 0) {
-    plans.push({
-      providerId: "copilot-gpt",
-      providerName: "GitHub Copilot (GPT/Grok)",
-      apiType: "openai-responses",
-      baseUrl: `${base}/v1`,
-      models: responsesIds.map((modelId) => ({ modelId, config: buildModelConfig(modelId, specFor(modelId)) })),
-    });
+  if ((byFamily.get("responses") ?? []).length > 0) {
+    plans.push(toPlan("responses", "copilot-gpt", "GitHub Copilot (GPT/Grok)", "openai-responses", `${base}/v1`));
   }
-  const completionsIds = byFamily.get("completions") ?? [];
-  if (completionsIds.length > 0) {
-    plans.push({
-      providerId: "copilot-openai",
-      providerName: "GitHub Copilot (OpenAI Chat)",
-      apiType: "openai-chat-completions",
-      baseUrl: `${base}/v1`,
-      models: completionsIds.map((modelId) => ({ modelId, config: buildModelConfig(modelId, { efforts: [], offType: "omit" }) })),
-    });
+  if ((byFamily.get("completions") ?? []).length > 0) {
+    plans.push(toPlan("completions", "copilot-openai", "GitHub Copilot (OpenAI Chat)", "openai-chat-completions", `${base}/v1`));
   }
   return plans;
 }

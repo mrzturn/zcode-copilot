@@ -270,7 +270,6 @@ function sanitizeChatCompletionsBody(parsed) {
   if (!parsed || typeof parsed !== "object") return parsed;
   const body = { ...parsed };
   delete body.store;
-  delete body.reasoning_effort;
   if (Array.isArray(body.messages)) {
     body.messages = body.messages.map((message) => {
       if (message && typeof message === "object" && message.role === "developer") {

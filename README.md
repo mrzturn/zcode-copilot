@@ -72,9 +72,10 @@ node dist/cli.mjs daemon start|stop|status
 ## 已验证能力
 
 - Claude（anthropic-messages）：流式、工具调用、思考档位（adaptive thinking，low~max）
-- GPT/Grok（openai-responses）：流式、函数调用、reasoning effort（none/minimal~max）
-- chat/completions：流式、请求体兼容清洗（store / reasoning_effort / developer 角色）
-- **思考档位按模型实测**：setup 时逐模型探测支持档位（如 gpt-5.3-codex 支持 none~xhigh、gpt-6.1-sol 仅 low~max、Claude 5.5 的关闭档为 between_tools），写入精确档位集合
+- GPT/Grok（openai-responses）：流式、函数调用、reasoning effort（none~max 按模型）
+- gemini / kimi（openai-chat-completions）：流式、reasoning_effort（gemini 返回思考文本）
+- **模型元数据来自 /models 声明**：思考档位（capabilities.supports.reasoning_effort）、上下文窗口与输出上限（capabilities.limits）、视觉/PDF 能力均按官方声明写入，声明缺失即视为不支持思考
+- Claude 关闭思考机制逐模型实测（5.5 需 between_tools、4.x 接受 disabled、opus-5.5 只能省略字段）
 - 令牌临期自动刷新（提前 5 分钟，单飞）
 - 企业版账号自动推导 API 域名（token 内 `proxy-ep`）
 
