@@ -1,0 +1,20 @@
+{
+  "name": "zcode-copilot-local",
+  "owner": {
+    "name": "mrzturn"
+  },
+  "plugins": [
+    {
+      "name": "zcode-copilot",
+      "source": "./",
+      "version": "0.1.0",
+      "description": "Use your GitHub Copilot subscription models in ZCode (local dev marketplace)",
+      "displayName": "zcode-copilot",
+      "displayName_i18n": {
+        "zh-CN": "zcode-copilot（GitHub Copilot 模型接入）",
+        "en-US": "zcode-copilot (GitHub Copilot models)"
+      },
+      "category": "productivity"
+    }
+  ]
+}

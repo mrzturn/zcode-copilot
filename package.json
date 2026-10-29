@@ -1,0 +1,22 @@
+{
+  "name": "zcode-copilot",
+  "version": "0.1.0",
+  "description": "Use your GitHub Copilot subscription models in ZCode (OAuth device login + local proxy + auto provider registration)",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "tsc --noEmit && esbuild src/mcp-server.ts src/daemon.ts src/cli.ts --bundle --platform=node --format=esm --target=node18 --outdir=dist --out-extension:.js=.mjs --sourcemap",
+    "typecheck": "tsc --noEmit",
+    "cli": "node dist/cli.mjs"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "@types/node": "^22.10.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.7.0",
+    "zod": "^3.24.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

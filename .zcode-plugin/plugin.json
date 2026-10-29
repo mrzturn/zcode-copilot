@@ -1,0 +1,25 @@
+{
+  "name": "zcode-copilot",
+  "version": "0.1.0",
+  "description": "Use your GitHub Copilot subscription models in ZCode",
+  "description_i18n": {
+    "zh-CN": "在 ZCode 中使用 GitHub Copilot 订阅模型（登录订阅、自动刷新令牌、一键注册模型提供商）",
+    "en-US": "Use your GitHub Copilot subscription models in ZCode (OAuth login, token auto-refresh, one-click provider setup)"
+  },
+  "author": {
+    "name": "mrzturn",
+    "url": "https://github.com/mrzturn/zcode-copilot"
+  },
+  "license": "Apache-2.0",
+  "keywords": ["github", "copilot", "model", "provider", "oauth"],
+  "repository": "https://github.com/mrzturn/zcode-copilot",
+  "homepage": "https://github.com/mrzturn/zcode-copilot",
+  "commands": "./commands",
+  "mcpServers": {
+    "zcode_copilot": {
+      "command": "node",
+      "args": ["${ZCODE_PLUGIN_ROOT}/dist/mcp-server.mjs"],
+      "timeoutMs": 180000
+    }
+  }
+}

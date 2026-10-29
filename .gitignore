@@ -147,3 +147,8 @@ vite.config.ts.timestamp-*
 
 # Turbo Repo
 .turbo
+.zcode/
+
+# 插件分发需要提交构建产物（marketplace 安装直接使用）
+!dist/
+dist/*.map
