@@ -21989,6 +21989,17 @@ async function copyToClipboard(text) {
 }
 
 // src/catalog.ts
+function modelFamily(modelId) {
+  if (/^claude-(haiku|sonnet|opus|fable)-[45]([.-]|$)/.test(modelId)) return "claude";
+  if (/^(gpt-|grok-|oswe|mai-)/.test(modelId)) return "responses";
+  return "completions";
+}
+var STATIC_REASONING_FALLBACK = {
+  claude: ["low", "medium", "high"],
+  gpt: ["low", "medium", "high"],
+  grok: ["minimal", "low", "medium", "high", "xhigh"],
+  completions: []
+};
 var EXTENDED_CONTEXT_MODEL_IDS = /* @__PURE__ */ new Set([
   "claude-fable-5",
   "claude-opus-4.8",
@@ -22001,11 +22012,6 @@ var EXTENDED_CONTEXT_MODEL_IDS = /* @__PURE__ */ new Set([
   "gpt-6-luna",
   "gpt-6-sol"
 ]);
-function modelFamily(modelId) {
-  if (/^claude-(haiku|sonnet|opus|fable)-[45]([.-]|$)/.test(modelId)) return "claude";
-  if (/^(gpt-|grok-|oswe|mai-)/.test(modelId)) return "responses";
-  return "completions";
-}
 function contextWindowFor(modelId, family) {
   if (EXTENDED_CONTEXT_MODEL_IDS.has(modelId)) return 1e6;
   if (family === "claude") return 2e5;
@@ -22019,27 +22025,16 @@ function maxOutputTokensFor(modelId, family) {
   if (/^grok-/.test(modelId)) return 64e3;
   return 32768;
 }
-function reasoningSpec(modelId, family) {
+function reasoningMap(family, offType) {
   if (family === "claude") {
-    if (/^claude-haiku/.test(modelId)) {
-      return { values: ["disabled"], map: "{}" };
-    }
-    return {
-      values: ["disabled", "low", "medium", "high"],
-      map: [
-        'reasoningLevel == "disabled"',
-        '? {"thinking": {"type": "disabled"}}',
-        ': {"thinking": {"type": "enabled", "budget_tokens": reasoningLevel == "low" ? 2048 : reasoningLevel == "high" ? 16384 : 8192}}'
-      ].join(" ")
-    };
+    const offValue = offType === "between_tools" ? '{"thinking": {"type": "between_tools"}}' : offType === "disabled" ? '{"thinking": {"type": "disabled"}}' : "{}";
+    return [
+      'reasoningLevel == "disabled"',
+      `? ${offValue}`,
+      ': {"thinking": {"type": "adaptive"}, "output_config": {"effort": reasoningLevel}}'
+    ].join(" ");
   }
-  if (family === "responses") {
-    if (/^grok-/.test(modelId)) {
-      return { values: ["low", "high"], map: '{"reasoning": {"effort": reasoningLevel}}' };
-    }
-    return { values: ["low", "medium", "high"], map: '{"reasoning": {"effort": reasoningLevel}}' };
-  }
-  return { values: ["disabled"], map: "{}" };
+  return '{"reasoning": {"effort": reasoningLevel}}';
 }
 function maxOutputTokensMap(family) {
   if (family === "claude") return "{'max_tokens': maxOutputTokens}";
@@ -22055,9 +22050,9 @@ function supportsMidConversationSystem(modelId, family) {
   if (family === "claude" || family === "responses") return true;
   return modelId === "kimi-k3";
 }
-function buildModelConfig(modelId) {
+function buildModelConfig(modelId, spec) {
   const family = modelFamily(modelId);
-  const reasoning = reasoningSpec(modelId, family);
+  const values = family === "claude" ? ["disabled", ...spec.efforts] : family === "responses" ? [...spec.efforts] : ["disabled"];
   return {
     enabled: true,
     properties: {
@@ -22076,12 +22071,15 @@ function buildModelConfig(modelId) {
       supportsMidConversationSystem: supportsMidConversationSystem(modelId, family)
     },
     optionSpecs: {
-      reasoningLevel: { values: reasoning.values, map: reasoning.map },
+      reasoningLevel: {
+        values,
+        map: family === "completions" ? "{}" : reasoningMap(family, spec.offType)
+      },
       maxOutputTokens: { max: maxOutputTokensFor(modelId, family), map: maxOutputTokensMap(family) }
     }
   };
 }
-function buildProviderPlans(availableModelIds) {
+function buildProviderPlans(availableModelIds, specByModel) {
   const byFamily = /* @__PURE__ */ new Map();
   for (const modelId of availableModelIds) {
     const family = modelFamily(modelId);
@@ -22089,6 +22087,19 @@ function buildProviderPlans(availableModelIds) {
     list.push(modelId);
     byFamily.set(family, list);
   }
+  const specFor = (modelId) => {
+    const family = modelFamily(modelId);
+    const probed = specByModel?.get(modelId);
+    if (probed) return probed;
+    if (family === "responses") {
+      return {
+        efforts: /^grok-/.test(modelId) ? STATIC_REASONING_FALLBACK.grok : STATIC_REASONING_FALLBACK.gpt,
+        offType: "omit"
+      };
+    }
+    if (family === "claude") return { efforts: STATIC_REASONING_FALLBACK.claude, offType: "disabled" };
+    return { efforts: [], offType: "omit" };
+  };
   const base = proxyBaseUrl();
   const plans = [];
   const claudeIds = byFamily.get("claude") ?? [];
@@ -22098,7 +22109,7 @@ function buildProviderPlans(availableModelIds) {
       providerName: "GitHub Copilot (Claude)",
       apiType: "anthropic-messages",
       baseUrl: base,
-      models: claudeIds.map((modelId) => ({ modelId, config: buildModelConfig(modelId) }))
+      models: claudeIds.map((modelId) => ({ modelId, config: buildModelConfig(modelId, specFor(modelId)) }))
     });
   }
   const responsesIds = byFamily.get("responses") ?? [];
@@ -22108,7 +22119,7 @@ function buildProviderPlans(availableModelIds) {
       providerName: "GitHub Copilot (GPT/Grok)",
       apiType: "openai-responses",
       baseUrl: `${base}/v1`,
-      models: responsesIds.map((modelId) => ({ modelId, config: buildModelConfig(modelId) }))
+      models: responsesIds.map((modelId) => ({ modelId, config: buildModelConfig(modelId, specFor(modelId)) }))
     });
   }
   const completionsIds = byFamily.get("completions") ?? [];
@@ -22118,7 +22129,7 @@ function buildProviderPlans(availableModelIds) {
       providerName: "GitHub Copilot (OpenAI Chat)",
       apiType: "openai-chat-completions",
       baseUrl: `${base}/v1`,
-      models: completionsIds.map((modelId) => ({ modelId, config: buildModelConfig(modelId) }))
+      models: completionsIds.map((modelId) => ({ modelId, config: buildModelConfig(modelId, { efforts: [], offType: "omit" }) }))
     });
   }
   return plans;
@@ -22238,6 +22249,139 @@ async function credentialStatus() {
     baseUrl: credential.access ? copilotBaseUrl(credential.access, credential.enterpriseDomain) : void 0,
     availableModelCount: credential.availableModelIds?.length ?? 0
   };
+}
+
+// src/reasoning-probe.ts
+var EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+function parseSupportedList(message) {
+  const match = /Supported values are: ([^.]+)/u.exec(message) ?? /supported values: \[([^\]]+)\]/u.exec(message);
+  if (!match?.[1]) return null;
+  const values = match[1].split(/['\s,]+/).map((value) => value.trim()).filter((value) => EFFORT_ORDER.includes(value));
+  return values.length > 0 ? values : null;
+}
+async function postJson(url, token, body, timeoutMs = 15e3) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+      ...COPILOT_STATIC_HEADERS
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(timeoutMs)
+  });
+  const text = await response.text();
+  let message = text;
+  try {
+    const parsed = JSON.parse(text);
+    if (typeof parsed.error === "string") message = parsed.error;
+    else if (parsed.error && typeof parsed.error.message === "string") message = parsed.error.message;
+    const nested = /^\s*\{/.test(message) ? JSON.parse(message) : null;
+    if (nested?.error && typeof nested.error.message === "string") message = nested.error.message;
+  } catch {
+  }
+  return { status: response.status, message };
+}
+async function probeClaudeOff(baseUrl, token, modelId) {
+  const betweenTools = await postJson(`${baseUrl}/v1/messages`, token, {
+    model: modelId,
+    max_tokens: 16,
+    messages: [{ role: "user", content: "hi" }],
+    thinking: { type: "between_tools" }
+  });
+  if (betweenTools.status === 200) return "between_tools";
+  const disabled = await postJson(`${baseUrl}/v1/messages`, token, {
+    model: modelId,
+    max_tokens: 16,
+    messages: [{ role: "user", content: "hi" }],
+    thinking: { type: "disabled" }
+  });
+  if (disabled.status === 200) return "disabled";
+  return "omit";
+}
+async function probeClaude(baseUrl, token, modelId) {
+  const offType = await probeClaudeOff(baseUrl, token, modelId);
+  const result = await postJson(`${baseUrl}/v1/messages`, token, {
+    model: modelId,
+    max_tokens: 16,
+    messages: [{ role: "user", content: "hi" }],
+    thinking: { type: "adaptive" },
+    output_config: { effort: "ultra" }
+  });
+  if (result.status === 200) {
+    return { efforts: STATIC_REASONING_FALLBACK.claude, offType };
+  }
+  if (/does not support reasoning effort/i.test(result.message)) {
+    return { efforts: [], offType };
+  }
+  const efforts = parseSupportedList(result.message) ?? STATIC_REASONING_FALLBACK.claude;
+  return { efforts, offType };
+}
+async function probeResponsesOnce(baseUrl, token, modelId, effort) {
+  return postJson(`${baseUrl}/responses`, token, {
+    model: modelId,
+    input: "hi",
+    max_output_tokens: 16,
+    reasoning: { effort }
+  });
+}
+async function probeResponses(baseUrl, token, modelId) {
+  const offType = "omit";
+  const minimal = await probeResponsesOnce(baseUrl, token, modelId, "minimal");
+  if (minimal.status !== 200) {
+    if (/Bad Request/.test(minimal.message) && !/Supported values/.test(minimal.message)) {
+      return { efforts: STATIC_REASONING_FALLBACK.grok, offType };
+    }
+    return { efforts: parseSupportedList(minimal.message) ?? STATIC_REASONING_FALLBACK.gpt, offType };
+  }
+  const none = await probeResponsesOnce(baseUrl, token, modelId, "none");
+  if (none.status !== 200) {
+    return { efforts: parseSupportedList(none.message) ?? STATIC_REASONING_FALLBACK.gpt, offType };
+  }
+  const max = await probeResponsesOnce(baseUrl, token, modelId, "max");
+  if (max.status !== 200) {
+    return { efforts: parseSupportedList(max.message) ?? STATIC_REASONING_FALLBACK.gpt, offType };
+  }
+  return { efforts: [...EFFORT_ORDER], offType };
+}
+async function detectModelReasoning(copilotToken, baseUrl, modelId) {
+  const family = modelFamily(modelId);
+  try {
+    if (family === "claude") return await probeClaude(baseUrl, copilotToken, modelId);
+    if (family === "responses") {
+      if (/^grok-/.test(modelId)) return { efforts: STATIC_REASONING_FALLBACK.grok, offType: "omit" };
+      return await probeResponses(baseUrl, copilotToken, modelId);
+    }
+    return { efforts: [], offType: "omit" };
+  } catch {
+    if (family === "claude") return { efforts: STATIC_REASONING_FALLBACK.claude, offType: "disabled" };
+    if (family === "responses") {
+      return {
+        efforts: /^grok-/.test(modelId) ? STATIC_REASONING_FALLBACK.grok : STATIC_REASONING_FALLBACK.gpt,
+        offType: "omit"
+      };
+    }
+    return { efforts: [], offType: "omit" };
+  }
+}
+async function detectReasoningForModels(copilotToken, baseUrl, modelIds, options = {}) {
+  const concurrency = options.concurrency ?? 4;
+  const results = /* @__PURE__ */ new Map();
+  const queue = [...modelIds];
+  let done = 0;
+  async function worker() {
+    for (; ; ) {
+      const modelId = queue.shift();
+      if (!modelId) return;
+      const spec = await detectModelReasoning(copilotToken, baseUrl, modelId);
+      results.set(modelId, spec);
+      done += 1;
+      options.onProgress?.(done, queue.length + done);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, modelIds.length) }, () => worker()));
+  await sleep(200);
+  return results;
 }
 
 // src/zcode-config.ts
@@ -22553,7 +22697,17 @@ async function runSetup() {
       message: "\u8BA2\u9605\u6CA1\u6709\u53EF\u7528\u7684\u6A21\u578B\uFF08\u5747\u4E0D\u652F\u6301\u5DE5\u5177\u8C03\u7528\u6216\u88AB\u7981\u7528\uFF09\u3002"
     };
   }
-  const plans = buildProviderPlans(availableModelIds);
+  let specByModel;
+  try {
+    specByModel = await detectReasoningForModels(
+      copilotToken,
+      copilotBaseUrl(copilotToken, enterpriseDomain),
+      availableModelIds
+    );
+  } catch {
+    specByModel = void 0;
+  }
+  const plans = buildProviderPlans(availableModelIds, specByModel);
   const { backupPath } = await upsertCopilotProviders(plans);
   const daemon = await ensureDaemon();
   const status = await credentialStatus();
@@ -22567,7 +22721,10 @@ async function runSetup() {
       providerName: plan.providerName,
       apiType: plan.apiType,
       baseUrl: plan.baseUrl,
-      models: plan.models.map((model) => model.modelId)
+      models: plan.models.map((model) => {
+        const levels = model.config.optionSpecs.reasoningLevel?.values ?? [];
+        return `${model.modelId}${levels.length > 0 ? ` (${levels.join("/")})` : ""}`;
+      })
     })),
     daemonRunning: daemon.ok,
     message: [

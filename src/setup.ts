@@ -6,7 +6,9 @@ import { importFromPiIfAvailable, readCredential, writeCredential } from "./stor
 import { credentialStatus, ensureFreshCredential } from "./token-manager.ts";
 import { checkDaemon, ensureDaemon } from "./daemon-manage.ts";
 import { enableCopilotModels, fetchCopilotModels } from "./copilot/models.ts";
-import { buildProviderPlans, modelFamily } from "./catalog.ts";
+import { copilotBaseUrl } from "./copilot/constants.ts";
+import { buildProviderPlans, modelFamily, type ModelReasoningInput } from "./catalog.ts";
+import { detectReasoningForModels } from "./reasoning-probe.ts";
 import { inspectCopilotProviders, upsertCopilotProviders } from "./zcode-config.ts";
 
 export interface SetupSummary {
@@ -91,7 +93,19 @@ export async function runSetup(): Promise<SetupSummary> {
     };
   }
 
-  const plans = buildProviderPlans(availableModelIds);
+  // 实测每个模型的思考档位与 Claude 关闭机制（各模型支持集合不同；失败时 catalog 内部回退静态值）。
+  let specByModel: Map<string, ModelReasoningInput> | undefined;
+  try {
+    specByModel = await detectReasoningForModels(
+      copilotToken,
+      copilotBaseUrl(copilotToken, enterpriseDomain),
+      availableModelIds,
+    );
+  } catch {
+    specByModel = undefined;
+  }
+
+  const plans = buildProviderPlans(availableModelIds, specByModel);
   const { backupPath } = await upsertCopilotProviders(plans);
   const daemon = await ensureDaemon();
   const status = await credentialStatus();
@@ -106,7 +120,10 @@ export async function runSetup(): Promise<SetupSummary> {
       providerName: plan.providerName,
       apiType: plan.apiType,
       baseUrl: plan.baseUrl,
-      models: plan.models.map((model) => model.modelId),
+      models: plan.models.map((model) => {
+        const levels = (model.config.optionSpecs as { reasoningLevel?: { values?: string[] } }).reasoningLevel?.values ?? [];
+        return `${model.modelId}${levels.length > 0 ? ` (${levels.join("/")})` : ""}`;
+      }),
     })),
     daemonRunning: daemon.ok,
     message: [
