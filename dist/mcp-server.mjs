@@ -22638,7 +22638,7 @@ async function setupStatusView() {
 }
 
 // src/mcp-server.ts
-var PLUGIN_VERSION = "0.1.0";
+var PLUGIN_VERSION = "0.0.1";
 function textResult(payload) {
   return {
     content: [{ type: "text", text: JSON.stringify(payload, null, 2) }]

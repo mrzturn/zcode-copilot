@@ -1,6 +1,6 @@
 {
   "name": "zcode-copilot",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "description": "Use your GitHub Copilot subscription models in ZCode",
   "description_i18n": {
     "zh-CN": "在 ZCode 中使用 GitHub Copilot 订阅模型（登录订阅、自动刷新令牌、一键注册模型提供商）",

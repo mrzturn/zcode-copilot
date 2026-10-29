@@ -1,6 +1,6 @@
 {
   "name": "zcode-copilot",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "description": "Use your GitHub Copilot subscription models in ZCode (OAuth device login + local proxy + auto provider registration)",
   "type": "module",
   "private": true,
