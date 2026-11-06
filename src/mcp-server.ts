@@ -17,7 +17,7 @@ import { modelFamily } from "./catalog.ts";
 import { runSetup, setupStatusView } from "./setup.ts";
 import { removeCopilotProviders } from "./zcode-config.ts";
 
-const PLUGIN_VERSION = "0.0.1";
+const PLUGIN_VERSION = "0.0.2";
 
 function textResult(payload: unknown) {
   return {

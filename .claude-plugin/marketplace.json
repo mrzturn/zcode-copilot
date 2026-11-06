@@ -7,7 +7,7 @@
     {
       "name": "zcode-copilot",
       "source": "./",
-      "version": "0.0.1",
+      "version": "0.0.2",
       "description": "Use your GitHub Copilot subscription models in ZCode (local dev marketplace)",
       "displayName": "zcode-copilot",
       "displayName_i18n": {
