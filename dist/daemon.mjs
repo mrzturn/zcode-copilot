@@ -264,6 +264,59 @@ function sanitizeMessagesBody(parsed) {
   if (thinking && typeof thinking === "object" && thinking.type === "enabled") {
     body.thinking = { type: "adaptive" };
   }
+  if (Array.isArray(body.messages)) {
+    const systemParts = [];
+    const existing = body.system;
+    if (typeof existing === "string" && existing.trim()) {
+      systemParts.push(existing);
+    } else if (Array.isArray(existing)) {
+      for (const block of existing) {
+        const text = block?.text;
+        if (typeof text === "string" && text.trim()) systemParts.push(text);
+      }
+    }
+    const kept = [];
+    for (const message of body.messages) {
+      if (message && typeof message === "object" && message.role === "system") {
+        const content = message.content;
+        let text = "";
+        if (typeof content === "string") {
+          text = content;
+        } else if (Array.isArray(content)) {
+          text = content.filter(
+            (b) => !!b && typeof b === "object" && b.type === "text" && typeof b.text === "string"
+          ).map((b) => b.text).join("\n\n");
+        }
+        if (text.trim()) systemParts.push(text);
+        continue;
+      }
+      kept.push(message);
+    }
+    if (systemParts.length > 0) {
+      body.system = systemParts.join("\n\n");
+      body.messages = kept;
+    }
+  }
+  if (Array.isArray(body.messages)) {
+    const cleaned = [];
+    for (const message of body.messages) {
+      const m = message;
+      if (m && typeof m === "object" && m.role === "assistant" && Array.isArray(m.content)) {
+        const blocks = m.content.filter((b) => {
+          if (!b || typeof b !== "object") return true;
+          const t = b.type;
+          return t !== "thinking" && t !== "redacted_thinking";
+        });
+        if (blocks.length === 0) continue;
+        if (blocks.length !== m.content.length) {
+          cleaned.push({ ...m, content: blocks });
+          continue;
+        }
+      }
+      cleaned.push(message);
+    }
+    body.messages = cleaned;
+  }
   return body;
 }
 function sanitizeChatCompletionsBody(parsed) {
@@ -313,6 +366,48 @@ function createResponsesItemRewriter() {
       const item = json.item;
       if (item && typeof item.id === "string" && item.id !== canonical) {
         item.id = canonical;
+        changed = true;
+      }
+    }
+    return changed ? `data: ${JSON.stringify(json)}` : line;
+  };
+  return new Transform({
+    transform(chunk, _encoding, callback) {
+      try {
+        buffer += chunk.toString("utf-8");
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        callback(null, lines.map(rewriteLine).join("\n") + (lines.length ? "\n" : ""));
+      } catch {
+        callback(null, chunk.toString("utf-8"));
+      }
+    },
+    flush(callback) {
+      if (buffer) callback(null, rewriteLine(buffer));
+      else callback();
+    }
+  });
+}
+function createChatReasoningRewriter() {
+  let buffer = "";
+  const rewriteLine = (line) => {
+    if (!line.startsWith("data: ") || line.startsWith("data: [DONE]")) return line;
+    let json;
+    try {
+      json = JSON.parse(line.slice(6));
+    } catch {
+      return line;
+    }
+    const choices = json.choices;
+    if (!Array.isArray(choices)) return line;
+    let changed = false;
+    for (const choice of choices) {
+      const delta = choice?.delta;
+      if (!delta || typeof delta !== "object") continue;
+      const record = delta;
+      if (typeof record.reasoning_text === "string" && record.reasoning_content === void 0) {
+        record.reasoning_content = record.reasoning_text;
+        delete record.reasoning_text;
         changed = true;
       }
     }
@@ -447,6 +542,8 @@ async function handle(req, res) {
   const nodeStream = Readable.fromWeb(upstream.body);
   if (routeInfo.kind === "responses") {
     nodeStream.pipe(createResponsesItemRewriter()).pipe(res);
+  } else if (routeInfo.kind === "chat") {
+    nodeStream.pipe(createChatReasoningRewriter()).pipe(res);
   } else {
     nodeStream.pipe(res);
   }

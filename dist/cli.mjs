@@ -512,7 +512,7 @@ function reasoningMap(family, offType, hasEfforts) {
       ': {"thinking": {"type": "adaptive"}, "output_config": {"effort": reasoningLevel}}'
     ].join(" ");
   }
-  if (family === "responses") return '{"reasoning": {"effort": reasoningLevel}}';
+  if (family === "responses") return '{"reasoning": {"effort": reasoningLevel, "summary": "auto"}}';
   return '{"reasoning_effort": reasoningLevel}';
 }
 function maxOutputTokensMap(family) {

@@ -68,7 +68,7 @@ function maxOutputTokensFor(modelId: string, family: ModelFamily): number {
  * ZCode 档位值 → 请求参数的 CEL 映射。
  * - Claude：thinking adaptive + output_config.effort（400 报错指定的形态），
  *   关闭档按模型探测结果选 between_tools / disabled / 省略字段。
- * - responses：reasoning.effort 直接透传。
+ * - responses：reasoning.effort 透传，并固定携带 summary:"auto"（无 summary 时上游不下发思考链）。
  * - completions（gemini / kimi 等）：reasoning_effort 直接透传。
  */
 function reasoningMap(family: ModelFamily, offType: ClaudeThinkingOffType, hasEfforts: boolean): string {
@@ -86,7 +86,8 @@ function reasoningMap(family: ModelFamily, offType: ClaudeThinkingOffType, hasEf
       ': {"thinking": {"type": "adaptive"}, "output_config": {"effort": reasoningLevel}}',
     ].join(" ");
   }
-  if (family === "responses") return '{"reasoning": {"effort": reasoningLevel}}';
+  // [2026-10-30]-[Copilot 仅在带 summary 时下发 reasoning_summary_* 事件]-[缺省 summary 时模型照常思考但 ZCode 无思考链可渲染，实测 none 档与之共存安全]
+  if (family === "responses") return '{"reasoning": {"effort": reasoningLevel, "summary": "auto"}}';
   return '{"reasoning_effort": reasoningLevel}';
 }
 

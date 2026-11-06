@@ -10,7 +10,7 @@
  *
  * 职责：令牌注入与自动刷新、Copilot 必需身份头、动态头（X-Initiator /
  * Openai-Intent / Copilot-Vision-Request）、chat/completions 兼容性清洗，
- * SSE 流原样透传。
+ * SSE 流按需改写（responses 的 item_id 归一、chat 的 reasoning_text 改名）。
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -135,6 +135,77 @@ function sanitizeMessagesBody(parsed: unknown): unknown {
   if (thinking && typeof thinking === "object" && thinking.type === "enabled") {
     body.thinking = { type: "adaptive" };
   }
+  // [2026-11-06]-[GitHub Copilot 的 anthropic 端点拒收 messages 里的 role:'system'（要求用顶层 system 字段），zcode.z.ai 容忍该形态，问题只在 copilot lane 暴露为 400 invalid_request]-[转发前把 system 角色消息折叠进顶层 system，claude 系模型在 ZCode 中才可用]
+  if (Array.isArray(body.messages)) {
+    const systemParts: string[] = [];
+    const existing = body.system;
+    if (typeof existing === "string" && existing.trim()) {
+      systemParts.push(existing);
+    } else if (Array.isArray(existing)) {
+      for (const block of existing) {
+        const text = (block as { text?: unknown } | null)?.text;
+        if (typeof text === "string" && text.trim()) systemParts.push(text);
+      }
+    }
+    const kept: unknown[] = [];
+    for (const message of body.messages) {
+      if (
+        message &&
+        typeof message === "object" &&
+        (message as { role?: unknown }).role === "system"
+      ) {
+        const content = (message as { content?: unknown }).content;
+        let text = "";
+        if (typeof content === "string") {
+          text = content;
+        } else if (Array.isArray(content)) {
+          text = content
+            .filter(
+              (b): b is { type: "text"; text: string } =>
+                !!b &&
+                typeof b === "object" &&
+                (b as { type?: unknown }).type === "text" &&
+                typeof (b as { text?: unknown }).text === "string",
+            )
+            .map((b) => b.text)
+            .join("\n\n");
+        }
+        if (text.trim()) systemParts.push(text);
+        continue;
+      }
+      kept.push(message);
+    }
+    if (systemParts.length > 0) {
+      body.system = systemParts.join("\n\n");
+      body.messages = kept;
+    }
+  }
+  // [2026-11-06]-[跨模型回放时 thinking 块缺 signature 或签名不属当前模型，GitHub 严格校验直接 400]-[剥离历史中全部 thinking/redacted_thinking 块（签名跨模型一律失效，只剥无签名的堵不住 claude↔claude 混切），glm/gpt/claude 混用会话在 claude lane 可用]
+  if (Array.isArray(body.messages)) {
+    const cleaned: unknown[] = [];
+    for (const message of body.messages) {
+      const m = message as { role?: unknown; content?: unknown } | null;
+      if (
+        m &&
+        typeof m === "object" &&
+        m.role === "assistant" &&
+        Array.isArray(m.content)
+      ) {
+        const blocks = (m.content as unknown[]).filter((b) => {
+          if (!b || typeof b !== "object") return true;
+          const t = (b as { type?: unknown }).type;
+          return t !== "thinking" && t !== "redacted_thinking";
+        });
+        if (blocks.length === 0) continue;
+        if (blocks.length !== (m.content as unknown[]).length) {
+          cleaned.push({ ...(m as Record<string, unknown>), content: blocks });
+          continue;
+        }
+      }
+      cleaned.push(message);
+    }
+    body.messages = cleaned;
+  }
   return body;
 }
 
@@ -203,6 +274,57 @@ function createResponsesItemRewriter(): Transform {
       const item = json.item as { id?: unknown } | undefined;
       if (item && typeof item.id === "string" && item.id !== canonical) {
         item.id = canonical;
+        changed = true;
+      }
+    }
+    return changed ? `data: ${JSON.stringify(json)}` : line;
+  };
+  return new Transform({
+    transform(chunk: Buffer, _encoding: string, callback: (error?: Error | null, data?: string) => void) {
+      try {
+        buffer += chunk.toString("utf-8");
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        callback(null, lines.map(rewriteLine).join("\n") + (lines.length ? "\n" : ""));
+      } catch {
+        // 改写失败时宁可透传原始数据。
+        callback(null, chunk.toString("utf-8"));
+      }
+    },
+    flush(callback: (error?: Error | null, data?: string) => void) {
+      if (buffer) callback(null, rewriteLine(buffer));
+      else callback();
+    },
+  });
+}
+
+/**
+ * chat/completions 思考链改写：Copilot 对 kimi / gemini-3.8-flash 下发非标准的
+ * delta.reasoning_text（gemini-4-argon 仅 reasoning_opaque，无可读思考文本），
+ * 而 ZCode 的 openai-compatible 客户端只认 DeepSeek 风格的 reasoning_content，
+ * 不改写时这两个家族在 ZCode 中没有思考链可渲染。逐 SSE 行重命名该字段，
+ * reasoning_opaque 等其余字段原样保留（无状态续轮可能需要回传）。
+ */
+function createChatReasoningRewriter(): Transform {
+  let buffer = "";
+  const rewriteLine = (line: string): string => {
+    if (!line.startsWith("data: ") || line.startsWith("data: [DONE]")) return line;
+    let json: Record<string, unknown>;
+    try {
+      json = JSON.parse(line.slice(6)) as Record<string, unknown>;
+    } catch {
+      return line;
+    }
+    const choices = json.choices;
+    if (!Array.isArray(choices)) return line;
+    let changed = false;
+    for (const choice of choices) {
+      const delta = (choice as { delta?: unknown } | null)?.delta;
+      if (!delta || typeof delta !== "object") continue;
+      const record = delta as Record<string, unknown>;
+      if (typeof record.reasoning_text === "string" && record.reasoning_content === undefined) {
+        record.reasoning_content = record.reasoning_text;
+        delete record.reasoning_text;
         changed = true;
       }
     }
@@ -354,6 +476,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   const nodeStream = Readable.fromWeb(upstream.body as import("node:stream/web").ReadableStream);
   if (routeInfo.kind === "responses") {
     nodeStream.pipe(createResponsesItemRewriter()).pipe(res);
+  } else if (routeInfo.kind === "chat") {
+    nodeStream.pipe(createChatReasoningRewriter()).pipe(res);
   } else {
     nodeStream.pipe(res);
   }
